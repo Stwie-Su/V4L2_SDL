@@ -1,0 +1,31 @@
+{
+  // ---- CMake Tools：固定使用 build/，打开工程时自动配置 ----
+  "cmake.buildDirectory": "${workspaceFolder}/build",
+  "cmake.configureOnOpen": true,
+  "cmake.exportCompileCommandsFile": true,
+
+  // ---- 代码索引：让 C/C++ 扩展读取 CMake 生成的编译数据库 ----
+  "C_Cpp.default.compileCommands": "${workspaceFolder}/build/compile_commands.json",
+  "C_Cpp.default.cStandard": "c11",
+  "C_Cpp.default.compilerPath": "/usr/bin/gcc",
+  "C_Cpp.default.intelliSenseMode": "linux-gcc-x64",
+  "C_Cpp.files.exclude": {
+    "**/.git": true,
+    "**/.vscode": true,
+    "**/.vs": true,
+    "**/build/**": true
+  },
+
+  // 本项目是纯 C，.h 一律按 C 语言解析（否则会被当成 C++）
+  "files.associations": {
+    "*.h": "c"
+  },
+
+  // build/ 是生成物，不参与搜索和文件监听
+  "search.exclude": {
+    "**/build": true
+  },
+  "files.watcherExclude": {
+    "**/build/**": true
+  }
+}

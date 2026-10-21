@@ -1,16 +1,6 @@
 /*
  * main_display.c —— 摄像头实时显示（最简版）
- *
- * 数据流（一帧走完全程）：
- *   V4L2 采集层（mmap 直接读到一帧 MJPG 字节流）
- *     → stb_image 把 MJPG（就是 JPEG）解码成 RGB888
- *       → SDL2 上传纹理 → 窗口显示
- *
- * 参数全部"写死"在下面 —— 来源：./build/v4l2_probe 的探测结果。
- * 换相机 / 换分辨率时，改下面三个常量即可。
- *
- * 操作：窗口里按 ESC 或 q 退出，点窗口关闭按钮也行。
- *      运行时每秒打印一行统计：帧率 + 本进程 CPU 占用。
+ * 流程：V4L2阻塞取帧(MJPG) → stb软解(RGB) → SDL上传纹理并显示
  */
 
 #include <SDL2/SDL.h>
@@ -23,13 +13,13 @@
 #include "stb_image.h"
 #include "v4l2_capture.h"
 
-/* ---------- 写死的参数（来自 v4l2_probe 探测报告） ---------- */
+/* 写死的参数：设备、分辨率、缓冲数 */
 #define CAM_DEV   "/dev/video0"
-#define CAM_W     864
-#define CAM_H     480
-#define CAM_BUFS  4               /* 驱动缓冲个数 */
+#define CAM_W     1280
+#define CAM_H     720
+#define CAM_BUFS  4
 
-/* ---------- 小工具：取当前时间（毫秒，单调时钟） ---------- */
+/* 取单调时钟毫秒（算帧率用，防系统时间跳变） */
 static double now_ms(void)
 {
     struct timespec ts;
@@ -37,14 +27,11 @@ static double now_ms(void)
     return ts.tv_sec * 1000.0 + ts.tv_nsec / 1000000.0;
 }
 
-/* ---------- 小工具：读本进程已消耗的 CPU 时间（单位：时钟滴答） ----------
- * /proc/self/stat 第 14、15 个字段是 utime + stime。
- * 第 2 个字段（进程名）带括号且可能含空格，所以先从最后一个 ')' 之后开始数。 */
+/* 读进程消耗的CPU滴答数（utime + stime），从最后一个 ')' 后开始解析 */
 static long proc_cpu_ticks(void)
 {
     FILE *f = fopen("/proc/self/stat", "r");
-    if (!f)
-        return 0;
+    if (!f) return 0;
     char buf[512];
     if (!fgets(buf, sizeof(buf), f)) {
         fclose(f);
@@ -61,17 +48,16 @@ static long proc_cpu_ticks(void)
     return utime + stime;
 }
 
-/* ---------- 每秒打印一次：帧率 + 本进程 CPU 占用 ---------- */
+/* 统计打印：满1秒算一次fps和CPU%，然后清零重计 */
 static void stats_tick(int *frames, double *t_begin, long *cpu_begin)
 {
     (*frames)++;
     double t_now = now_ms();
     double dt = t_now - *t_begin;
-    if (dt < 1000.0)
-        return;
+    if (dt < 1000.0) return;
 
     long  cpu_now = proc_cpu_ticks();
-    long  clk     = sysconf(_SC_CLK_TCK);          /* 每秒多少个滴答 */
+    long  clk     = sysconf(_SC_CLK_TCK);
     double cpu_pct = (cpu_now - *cpu_begin) * 100.0 / clk / (dt / 1000.0);
 
     printf("[stats] %.1f fps | 本进程 CPU 占用 %.1f%%\n",
@@ -84,14 +70,12 @@ static void stats_tick(int *frames, double *t_begin, long *cpu_begin)
 
 int main(void)
 {
-    /* 日志按行刷新：stdout 重定向到文件时默认是 4KB 块缓冲，
-     * 不设这一行，日志会攒在内存里看不到（前台终端不受影响）。 */
-    setvbuf(stdout, NULL, _IOLBF, 0);
+    setvbuf(stdout, NULL, _IOLBF, 0); /* 日志行缓冲，重定向到文件也能实时看 */
 
     /* ---- 1. 启动 V4L2 采集 ---- */
     if (v4l2_capture_start(CAM_DEV, CAM_W, CAM_H, CAM_BUFS) != 0)
         return 1;
-    uint32_t w = v4l2_capture_width();
+    uint32_t w = v4l2_capture_width();   /* 必须用驱动实际协商的宽高 */
     uint32_t h = v4l2_capture_height();
 
     /* ---- 2. 初始化 SDL 窗口 ---- */
@@ -100,16 +84,18 @@ int main(void)
         v4l2_capture_stop();
         return 1;
     }
+    
     SDL_Window *win = SDL_CreateWindow("V4L2 preview  (ESC quit)",
                                        SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
                                        (int)w, (int)h, 0);
+    /* 渲染器不加 VSYNC，防止 Present 阻塞等屏幕刷新 */
     SDL_Renderer *ren = win ? SDL_CreateRenderer(win, -1, SDL_RENDERER_ACCELERATED) : NULL;
-    /* 像素格式用 RGB24：stb 解码输出就是 RGB888（每像素 3 字节 R,G,B），零转换直接上传 */
+    /* 纹理选 RGB24，和 stb 输出的格式完全一致，上传时零转换 */
     SDL_Texture *tex = ren ? SDL_CreateTexture(ren, SDL_PIXELFORMAT_RGB24,
                                                SDL_TEXTUREACCESS_STREAMING,
                                                (int)w, (int)h) : NULL;
     if (!win || !ren || !tex) {
-        fprintf(stderr, "SDL 窗口/渲染器/纹理 创建失败: %s\n", SDL_GetError());
+        fprintf(stderr, "SDL 创建失败: %s\n", SDL_GetError());
         if (tex) SDL_DestroyTexture(tex);
         if (ren) SDL_DestroyRenderer(ren);
         if (win) SDL_DestroyWindow(win);
@@ -125,45 +111,56 @@ int main(void)
     long   cpu_begin = proc_cpu_ticks();
 
     while (!quit) {
-        /* 3.1 处理窗口事件（退出） */
+        /* 【① 非阻塞探路】 */
+        /* 瞄一眼有没有按ESC或点关闭。没事件立刻返回0，绝不逗留、不耽误下面等帧 */
         SDL_Event ev;
-        while (SDL_PollEvent(&ev)) {
-            if (ev.type == SDL_QUIT ||
-                (ev.type == SDL_KEYDOWN &&
-                 (ev.key.keysym.sym == SDLK_ESCAPE || ev.key.keysym.sym == SDLK_q)))
+        while (SDL_PollEvent(&ev)) 
+        {
+            if (ev.type == SDL_QUIT || 
+               (ev.type == SDL_KEYDOWN && 
+               (ev.key.keysym.sym == SDLK_ESCAPE || ev.key.keysym.sym == SDLK_q)))
                 quit = 1;
         }
+        /* 必须在进阻塞等帧前退出，否则按了ESC还得傻等一帧才退 */
         if (quit)
             break;
 
-        /* 3.2 取一帧 MJPG（没帧就阻塞等待） */
+        /* 【② 阻塞等帧】 */
+        /* 内部是阻塞 DQBUF。没数据就睡死在这，CPU占用为0。这里决定了循环快慢 */
         const uint8_t *jpg;
         size_t jpg_len;
         if (v4l2_capture_get(&jpg, &jpg_len) != 0)
             break;
 
-        /* 3.3 解码 MJPG → RGB888 */
+        /* 【③ 解码处理】 */
+        /* stb 在 CPU 上把 MJPG 解成 RGB888，返回新 malloc 的内存 */
         int dw, dh;
         unsigned char *rgb = stbi_load_from_memory(jpg, (int)jpg_len, &dw, &dh, NULL, 3);
-        v4l2_capture_done(jpg);      /* 数据到手就还回缓冲，让驱动继续往里填 */
+        
+        /* 重点：解码完必须立刻归还驱动 buffer，让底层去填下一帧 */
+        v4l2_capture_done(jpg); 
 
         if (!rgb) {
             printf("[display] 第 %d 帧解码失败，跳过\n", frames);
-            continue;
+            continue; /* buffer 已归还，直接跳过这次显示 */
         }
 
-        /* 3.4 上传纹理并显示整帧 */
+        /* 【④ 显示（三次搬动）】 */
+        /* 1. 把 CPU 内存丢进显存（拷贝），pitch = dw*3 */
         SDL_UpdateTexture(tex, NULL, rgb, dw * 3);
+        /* 拷贝完就能释放 stb 解出来的内存了 */
         stbi_image_free(rgb);
 
+        /* 2. 清后台 + 画图 + 翻页给用户看 */
         SDL_RenderClear(ren);
         SDL_RenderCopy(ren, tex, NULL, NULL);
         SDL_RenderPresent(ren);
 
+        /* 3. 统计 */
         stats_tick(&frames, &t_begin, &cpu_begin);
     }
 
-    /* ---- 4. 收尾 ---- */
+    /* ---- 4. 收尾：逆序销毁 ---- */
     SDL_DestroyTexture(tex);
     SDL_DestroyRenderer(ren);
     SDL_DestroyWindow(win);

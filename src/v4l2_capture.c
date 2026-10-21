@@ -68,7 +68,7 @@ int v4l2_capture_start(const char *dev, uint32_t width, uint32_t height, uint32_
     if (buf_count < 2 || buf_count > MAX_BUFS)
         buf_count = 4;
 
-    /* ① 打开设备 */
+    /* ① 阻塞打开设备，无数据则休眠 */
     g.fd = open(dev, O_RDWR);
     if (g.fd < 0) {
         fprintf(stderr, "[capture] open %s 失败: %s\n", dev, strerror(errno));
@@ -178,6 +178,7 @@ fail:
     return -1;
 }
 
+/* 取一帧：从驱动出队，通过双重指针把数据地址“带出”函数 */
 int v4l2_capture_get(const uint8_t **frame, size_t *len)
 {
     if (!g.streaming)
@@ -188,39 +189,46 @@ int v4l2_capture_get(const uint8_t **frame, size_t *len)
     buf.type   = V4L2_BUF_TYPE_VIDEO_CAPTURE;
     buf.memory = V4L2_MEMORY_MMAP;
 
-    /* 出队：没帧时本进程会在这里睡着，驱动填好一帧后唤醒（阻塞模式） */
+    /* 阻塞点：没帧睡在这，驱动填好一帧才唤醒。拿到的是该缓冲的“取件码” */
     if (xioctl(g.fd, VIDIOC_DQBUF, &buf) < 0) {
         fprintf(stderr, "[capture] VIDIOC_DQBUF 失败: %s\n", strerror(errno));
         return -1;
     }
+
+    /* 通过二级指针，把第 buf.index 号内存的地址写给外部变量 */
     *frame = g.addr[buf.index];
-    *len   = buf.bytesused;              /* 这一帧的实际字节数（MJPG 即 JPEG 数据长度） */
+    /* 输出实际数据长度 */
+    *len   = buf.bytesused;
     return 0;
 }
 
+/* 还一帧：把用户用完的空缓冲重新入队 */
 int v4l2_capture_done(const uint8_t *frame)
 {
     if (!g.streaming)
         return -1;
 
-    /* 用指针反查它属于哪个缓冲（get 给出去的就是这些地址之一） */
+    /* 内核只认 index，所以先拿外部传回的地址，反查它是哪一号缓冲 */
     uint32_t index = g.nbufs;
     for (uint32_t i = 0; i < g.nbufs; i++) {
-        if (g.addr[i] == frame) {
+        if (g.addr[i] == frame) {  /* 指针比对 */
             index = i;
             break;
         }
     }
-    if (index == g.nbufs) {
+    if (index == g.nbufs) {        /* 没找到：说明传进来的指针不对 */
         fprintf(stderr, "[capture] done：指针不认识（不是 get 给过的地址）\n");
         return -1;
     }
 
+    /* 填写入队信息 */
     struct v4l2_buffer buf;
     memset(&buf, 0, sizeof(buf));
     buf.type   = V4L2_BUF_TYPE_VIDEO_CAPTURE;
     buf.memory = V4L2_MEMORY_MMAP;
-    buf.index  = index;
+    buf.index  = index;            /* 告诉驱动还哪一号 */
+
+    /* 执行入队，把空缓冲还给驱动 */
     if (xioctl(g.fd, VIDIOC_QBUF, &buf) < 0) {
         fprintf(stderr, "[capture] VIDIOC_QBUF(还帧) 失败: %s\n", strerror(errno));
         return -1;
